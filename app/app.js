@@ -244,6 +244,9 @@ const TTS = {
     return new Promise(res => {
       if (!this.supported()) { noVoiceWarning(); res(false); return; }
       if (!this.voice) this.pick();
+      // The phone lists voices but none is Hebrew: its engine would read Hebrew text with an English voice.
+      // Don't — explain how to install a Hebrew voice instead (parent recordings still play).
+      if (this.all.length && !this.voices.length) { noHebrewVoice(); res(false); return; }
       const spoken = state.settings.ttsNikud ? text : strip(text);
       const u = new SpeechSynthesisUtterance(spoken);
       u.lang = (this.voice?.lang || 'he-IL').replace('_', '-');
@@ -296,6 +299,35 @@ function noVoiceWarning(reason) {
   toast(!TTS.supported() ? 'הדפדפן הזה לא תומך בהקראה. נסו Chrome או Safari, או הקליטו קריאה באזור ההורים 🎙️'
     : 'ההקראה לא הצליחה. בדקו שהעוצמה פתוחה ושיש קול עברי בהגדרות "המרת טקסט לדיבור" בטלפון. בדיקה מלאה: אזור הורים ← הגדרות 🎙️', 7000);
   console.warn('TTS failed:', reason);
+}
+/* Step-by-step help for installing a Hebrew voice (shown once per visit; later just a short toast) */
+let shownVoiceHelp = false;
+function noHebrewVoice() {
+  if (shownVoiceHelp) { toast('אין קול עברי בטלפון הזה — ראו "איך מתקינים קול עברי" באזור ההורים', 4000); return; }
+  shownVoiceHelp = true;
+  showVoiceHelp();
+}
+function showVoiceHelp() {
+  const android = /Android/i.test(navigator.userAgent);
+  const samsung = /SM-|Samsung/i.test(navigator.userAgent);
+  const steps = isIOS()
+    ? ['פתחו את "הגדרות" באייפון', 'נגישות ← תוכן מדובר ← קולות', 'בחרו "עברית" ← Carmit ← הורדה ⬇️', 'סגרו את האפליקציה לגמרי ופתחו שוב']
+    : android
+      ? [samsung ? 'בסמסונג: הגדרות ← ניהול כללי ← שפה ← "המרת טקסט לדיבור"' : 'פתחו "הגדרות" וחפשו "המרת טקסט לדיבור" (Text-to-speech)',
+        'מנוע מועדף: בחרו "Google" (שירותי דיבור של Google)' + (samsung ? ' — ולא Samsung' : ''),
+        'לחצו על ⚙️ ליד Google ← "התקנת נתוני קול" ← עברית ← הורדה ⬇️',
+        'אם אין Google ברשימה: התקינו מחנות Play את "שירותי דיבור של Google" (Speech Services by Google)',
+        'סגרו את האפליקציה לגמרי ופתחו שוב']
+      : ['במחשב Windows: פתחו את האתר בדפדפן Edge (יש בו קולות עבריים)', 'או: הגדרות ← זמן ושפה ← דיבור ← הוספת קולות ← עברית'];
+  const ov = h('div', { class: 'overlay', onclick: e => { if (e.target === ov) ov.remove(); } },
+    h('div', { class: 'pop stack', style: 'text-align:right;max-width:440px' },
+      h('div', { class: 'big', style: 'text-align:center' }, '🗣️'),
+      h('h2', {}, 'בטלפון הזה אין קול בעברית'),
+      h('p', { style: 'margin:0' }, 'בלי קול עברי, הטלפון היה מקריא את הטקסט באנגלית. כדי שינשופי ידבר עברית, צריך להתקין קול עברי (חינם, פעם אחת):'),
+      h('ol', { style: 'margin:0;padding-inline-start:22px;line-height:1.9' }, steps.map(s => h('li', {}, s))),
+      h('p', { class: 'muted', style: 'margin:0' }, 'בינתיים: הורה יכול להקליט את עצמו קורא (אזור הורים ← טקסטים ← 🎙️ הקלטה), והילד ישמע את הקול שלו.'),
+      h('button', { class: 'btn-full', onclick: () => ov.remove() }, 'הבנתי')));
+  document.body.append(ov);
 }
 async function say(text) {
   stopAll();
@@ -1529,6 +1561,8 @@ function pPrefs(body) {
   const showDiag = (result) => diag.replaceChildren(
     h('div', {}, TTS.supported() ? `קולות במכשיר: ${TTS.all.length} · קולות בעברית: ${TTS.voices.length}` : 'הדפדפן הזה לא תומך בהקראה (speechSynthesis)'),
     h('div', {}, `בשימוש: ${TTS.voice ? `${TTS.voice.name} (${TTS.voice.lang})` : 'ברירת המחדל של הטלפון לעברית (he-IL)'}`),
+    TTS.all.length && !TTS.voices.length ? h('div', { style: 'font-weight:700;color:var(--orange)' }, '⚠️ אין קול עברי מותקן בטלפון הזה, ולכן ההקראה הייתה יוצאת באנגלית.') : null,
+    TTS.all.length && !TTS.voices.length ? h('button', { class: 'btn-small btn-orange', style: 'margin-top:6px', onclick: showVoiceHelp }, '🛠️ איך מתקינים קול עברי') : null,
     result ? h('div', { style: `font-weight:700;color:var(${result.ok ? '--green' : '--orange'})` }, result.text) : null);
   showDiag();
   const testVoice = async () => {
