@@ -114,11 +114,11 @@ async function loadUserState() {
   try { localStorage.setItem(userKey(), JSON.stringify(state)); } catch { }
   if (fetched && chosen && chosen !== server) { dirty = true; pushProgress(); }
 }
-async function afterLogin(u) {
+async function afterLogin(u, isNew = false) {
   user = u;
   try { localStorage.setItem('kria.user', JSON.stringify(u)); } catch { }
   if (!u.must_change) await loadUserState();
-  location.hash = u.must_change ? '#/password' : '#/home';
+  location.hash = u.must_change ? '#/password' : (isNew && u.role !== 'admin' ? '#/welcome' : '#/home');
   render();
 }
 async function logout() {
@@ -126,6 +126,7 @@ async function logout() {
   try { await API.call('/logout', { method: 'POST' }); } catch { }
   user = null; parentOk = false; state = normalize({});
   try { localStorage.removeItem('kria.user'); } catch { }
+  await loadConfig();
   location.hash = '#/login'; render();
 }
 function day(k = todayKey()) { return state.days[k] || (state.days[k] = { mins: 0, acts: 0, did: {} }); }
@@ -405,6 +406,7 @@ function render() {
   else if (user?.must_change) name = 'password';
   else if (user && (name === 'login' || name === 'register' || name === 'onboard')) name = 'home';
   current = name;
+  document.body.classList.toggle('auth-screen', name === 'login' || name === 'register');
   app.replaceChildren();
   const fn = routes[name] || routes.home;
   const el = fn(...args.map(decodeURIComponent));
@@ -439,65 +441,162 @@ function errBox() { return h('div', { class: 'tip hidden', role: 'alert' }); }
 function showErr(box, msg) { box.textContent = '⚠️ ' + msg; box.classList.remove('hidden'); }
 function busy(btn, on, label) { btn.disabled = on; if (label) btn.textContent = label; }
 
-routes.login = () => {
-  const u = h('input', { type: 'text', placeholder: 'שם משתמש', autocomplete: 'username', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none', spellcheck: 'false' });
-  const pw = pwField('סיסמה', 'current-password');
-  const remember = h('input', { type: 'checkbox', checked: true, id: 'remember', style: 'width:22px;height:22px' });
+/* Landing page with login / register tabs — same structure as LinguaDov */
+let siteConfig = { registration: false, approval: false };
+async function loadConfig() { try { siteConfig = await API.call('/config'); } catch { } }
+const HELLOS = ['שָׁלוֹם!', 'קוֹרְאִים?', 'כׇּל הַכָּבוֹד!', 'בּוֹאוּ נִקְרָא', 'יוֹפִי!', 'מְעוּלֶּה!'];
+let helloTimer = null, deferredInstall = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; });
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+async function installApp() {
+  if (deferredInstall) { deferredInstall.prompt(); try { await deferredInstall.userChoice; } catch { } deferredInstall = null; return; }
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const safari = ios && !/CriOS|FxiOS|EdgiOS/.test(navigator.userAgent);
+  const steps = ios
+    ? [safari ? null : 'באייפון ההתקנה עובדת רק מ־Safari. פתחו את הכתובת ב־Safari.', 'לחצו על כפתור השיתוף ⬆️ בתחתית Safari', 'בחרו "הוספה למסך הבית" ➕', 'לחצו "הוסף" — וינשופי 🦉 יופיע במסך הבית']
+    : ['פתחו את תפריט הדפדפן ⋮', 'בחרו "התקנת אפליקציה" או "הוספה למסך הבית"', 'אשרו — וינשופי 🦉 יופיע במסך הבית'];
+  const ov = h('div', { class: 'overlay', onclick: e => { if (e.target === ov) ov.remove(); } },
+    h('div', { class: 'pop stack', style: 'text-align:right' }, h('h2', {}, '📲 התקנת קוראים בכיף'),
+      h('ol', { style: 'margin:0;padding-inline-start:22px;line-height:1.9' }, steps.filter(Boolean).map(s => h('li', {}, s))),
+      h('button', { class: 'btn-full', onclick: () => ov.remove() }, 'הבנתי')));
+  document.body.append(ov);
+}
+
+function authScreen(mode) {
+  document.body.classList.add('auth-screen');
+  clearInterval(helloTimer);
+  const canReg = siteConfig.registration;
+  if (!canReg) mode = 'login';
+  const formBox = h('section', { class: 'land-form card' });
+
+  const draw = m => {
+    mode = m;
+    history.replaceState(null, '', m === 'register' ? '#/register' : '#/login');
+    const tabs = canReg
+      ? h('div', { class: 'auth-tabs' },
+        h('button', { type: 'button', class: m === 'login' ? 'on' : '', onclick: () => draw('login') }, 'כניסה'),
+        h('button', { type: 'button', class: m === 'register' ? 'on' : '', onclick: () => draw('register') }, 'הרשמה'))
+      : h('h2', {}, 'כניסה');
+    formBox.replaceChildren(tabs, ...(m === 'register' ? registerForm() : loginForm()).filter(Boolean));
+    formBox.querySelector('input')?.focus();
+  };
+
+  const loginForm = () => {
+    const u = h('input', { type: 'text', autocomplete: 'username', autocapitalize: 'none', spellcheck: 'false', dir: 'ltr', required: true });
+    const pw = pwField('', 'current-password');
+    const remember = h('input', { type: 'checkbox', checked: true, style: 'width:22px;height:22px' });
+    const err = h('div', { class: 'form-error', role: 'alert' });
+    const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'כניסה');
+    const form = h('form', { class: 'stack', onsubmit: async e => {
+      e.preventDefault();
+      busy(btn, true, 'מתחברים...');
+      try { await afterLogin(await API.call('/login', { method: 'POST', body: { username: u.value.trim(), password: pw.inp.value, remember: remember.checked } })); }
+      catch (ex) { err.textContent = ex.message; busy(btn, false, 'כניסה'); pw.inp.value = ''; pw.inp.focus(); }
+    } },
+      h('label', { class: 'field' }, 'שם משתמש', u),
+      h('label', { class: 'field' }, 'סיסמה', pw.el),
+      h('label', { class: 'row remember' }, remember, 'להישאר מחובר במכשיר הזה'),
+      err, btn);
+    return [form, h('p', { class: 'muted center' }, canReg
+      ? ['אין לכם משתמש? ', h('button', { type: 'button', class: 'link-btn', onclick: () => draw('register') }, 'הירשמו עכשיו – זה בחינם')]
+      : 'אין לכם משתמש? בקשו מהמנהל לפתוח לכם אחד.')];
+  };
+
+  const registerForm = () => {
+    const name = h('input', { type: 'text', autocomplete: 'name', maxlength: 30, required: true, placeholder: 'למשל: נועם' });
+    const u = h('input', { type: 'text', autocomplete: 'username', autocapitalize: 'none', spellcheck: 'false', dir: 'ltr', required: true,
+      pattern: '[a-zA-Z0-9_.\\-]{3,30}', title: '3–30 תווים: אותיות באנגלית, ספרות, נקודה, מקף או קו תחתון', placeholder: 'noam' });
+    const pw = pwField('', 'new-password');
+    const pw2 = pwField('', 'new-password');
+    [pw.inp, pw2.inp].forEach(i => { i.minLength = 6; i.required = true; });
+    const err = h('div', { class: 'form-error', role: 'alert' });
+    const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'יצירת משתמש');
+    const form = h('form', { class: 'stack', onsubmit: async e => {
+      e.preventDefault();
+      if (pw.inp.value !== pw2.inp.value) { err.textContent = 'הסיסמאות לא זהות'; return; }
+      busy(btn, true, 'יוצרים משתמש...');
+      try {
+        const r = await API.call('/register', { method: 'POST', body: { display_name: name.value.trim(), username: u.value.trim(), password: pw.inp.value } });
+        if (r.pending) { clearInterval(helloTimer); formBox.replaceChildren(pendingBox(name.value.trim(), () => draw('login'))); return; }
+        await afterLogin(r, true);
+        toast(`🎉 ברוכים הבאים, ${r.display_name}!`);
+      } catch (ex) { err.textContent = ex.message; busy(btn, false, 'יצירת משתמש'); }
+    } },
+      h('label', { class: 'field' }, 'השם שלכם', name),
+      h('label', { class: 'field' }, 'שם משתמש (באנגלית)', u),
+      h('label', { class: 'field' }, 'סיסמה (לפחות 6 תווים)', pw.el),
+      h('label', { class: 'field' }, 'אימות סיסמה', pw2.el),
+      err, btn);
+    return [h('p', { class: 'muted', style: 'margin-top:0' }, 'פותחים משתמש ומתחילים לקרוא – בחינם. 🦉'), form,
+      siteConfig.approval ? h('p', { class: 'muted center' }, 'לאחר ההרשמה המנהל יאשר את המשתמש שלכם.') : null,
+      h('p', { class: 'muted center' }, 'כבר יש לכם משתמש? ', h('button', { type: 'button', class: 'link-btn', onclick: () => draw('login') }, 'כניסה'))];
+  };
+
+  const hello = h('span', {}, HELLOS[0]);
+  let hi = 0;
+  helloTimer = setInterval(() => {
+    if (!hello.isConnected) { clearInterval(helloTimer); return; }
+    hi = (hi + 1) % HELLOS.length;
+    hello.classList.remove('hpop'); void hello.offsetWidth; hello.textContent = HELLOS[hi]; hello.classList.add('hpop');
+  }, 1800);
+
+  const page = h('div', { class: 'landing' },
+    h('div', { class: 'land-bg', 'aria-hidden': 'true' }, ['📖', '✏️', '🔤', '⭐', '🌈', '🎈', '📚'].map((e, i) => h('span', { class: `fl fl${i}` }, e)),
+      h('span', { class: 'blob b1' }), h('span', { class: 'blob b2' })),
+    h('div', { class: 'land-grid' },
+      h('section', { class: 'land-hero' },
+        h('div', { class: 'land-logo' }, h('span', { class: 'land-owl' }, '🦉'), h('span', {}, 'קוראים ', h('b', {}, 'בכיף'))),
+        h('div', {}, h('div', { class: 'hello-bubble', 'aria-hidden': 'true' }, hello)),
+        h('h1', { class: 'land-title' }, 'קוראים בלי פחד', h('br'), h('span', { class: 'hl' }, '10 דקות ביום')),
+        h('p', { class: 'land-sub' }, 'תרגול קריאה וכתיבה בעברית לילדים בכיתות ג–ו. ינשופי מקריא, קוראים כמו הד, משחקי מילים וכותבים סיפורים — בלי שעון ובלי לחץ. בחינם.'),
+        h('div', { class: 'land-chips' }, ['👂 מקשיבים', '🔁 קוראים כמו הד', '🔍 מבינים', '✏️ כותבים', '🎮 משחקי מילים'].map(c => h('span', { class: 'land-chip' }, c))),
+        h('div', { class: 'land-stats' },
+          h('div', {}, h('b', {}, C.texts.length), h('span', {}, 'טקסטים')),
+          h('div', {}, h('b', {}, GAMES.length), h('span', {}, 'משחקים')),
+          h('div', {}, h('b', {}, '🎤'), h('span', {}, 'הקלטה עצמית')),
+          h('div', {}, h('b', {}, '₪0'), h('span', {}, 'בחינם')))),
+      formBox,
+      h('section', { class: 'land-features' },
+        [['🗺️', 'צעד אחרי צעד', 'מקשיבים, קוראים כמו הד, ואז קוראים לבד'],
+         ['🦉', 'ינשופי מקריא', 'כל מילה קשה — נגיעה ושומעים אותה'],
+         ['⭐', 'כוכבים ומדבקות', 'על כל מאמץ, בלי שעון ובלי לחץ'],
+         ['📱', 'אפליקציה בטלפון', 'מתקינים למסך הבית בלחיצה']]
+          .map(([e, t, s]) => h('div', { class: 'feat' }, h('span', {}, e), h('b', {}, t), h('small', {}, s))))),
+    isStandalone() ? null : h('button', { class: 'land-install', onclick: installApp }, '📲 התקינו את קוראים בכיף כאפליקציה'));
+  draw(mode);
+  return page;
+}
+function pendingBox(name, back) {
+  return h('div', { class: 'center stack' }, h('div', { style: 'font-size:3rem' }, '⏳'), h('h2', {}, `תודה ${name}!`),
+    h('p', {}, 'המשתמש נוצר ומחכה לאישור המנהל. אחרי האישור אפשר להיכנס עם שם המשתמש והסיסמה שבחרתם.'),
+    h('button', { class: 'btn-full', onclick: back }, 'חזרה לכניסה'));
+}
+routes.login = () => authScreen('login');
+routes.register = () => authScreen('register');
+
+/* First time after registering: pick how to be addressed and a character */
+routes.welcome = () => {
+  const p = { gender: state.profile.gender || 'm', avatar: state.profile.avatar || '🦊' };
   const err = errBox();
-  const regLink = h('div', { class: 'center' });
-  const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'כניסה 🚀');
-  const form = h('form', { class: 'card stack', onsubmit: async e => {
-    e.preventDefault();
-    if (!u.value.trim() || !pw.inp.value) { showErr(err, 'צריך למלא שם משתמש וסיסמה'); return; }
-    busy(btn, true, 'נכנסים...');
-    try { await afterLogin(await API.call('/login', { method: 'POST', body: { username: u.value.trim(), password: pw.inp.value, remember: remember.checked } })); }
-    catch (ex) { showErr(err, ex.message); busy(btn, false, 'כניסה 🚀'); }
-  } },
-    h('div', { class: 'field' }, h('label', {}, 'שם משתמש'), u),
-    h('div', { class: 'field' }, h('label', {}, 'סיסמה'), pw.el),
-    h('label', { class: 'row', style: 'font-weight:400;cursor:pointer' }, remember, 'לזכור אותי במכשיר הזה'),
-    err, btn);
-  API.call('/config').then(c => {
-    if (c.registration) regLink.append(h('span', {}, 'אין לך משתמש עדיין? '), h('a', { href: '#/register', style: 'color:var(--primary);font-weight:700' }, 'להרשמה ✨'));
-  }).catch(() => {});
+  const btn = h('button', { class: 'btn-big btn-full', onclick: async () => {
+    busy(btn, true);
+    try {
+      user = await API.call('/profile', { method: 'PUT', body: { display_name: user.display_name, gender: p.gender, avatar: p.avatar } });
+      localStorage.setItem('kria.user', JSON.stringify(user));
+      Object.assign(state.profile, { gender: p.gender, avatar: p.avatar, setup: true }); save();
+      location.hash = '#/home';
+    } catch (e) { showErr(err, e.message); busy(btn, false); }
+  } }, 'יאללה, מתחילים! 🚀');
   return h('div', { class: 'stack' },
     h('div', { class: 'center', style: 'font-size:72px;line-height:1' }, '🦉'),
-    h('h1', { class: 'center' }, 'קוראים בכיף'),
-    mascot('שלום! אני ינשופי. נכנסים עם שם המשתמש והסיסמה.'),
-    form, regLink);
+    h('h1', { class: 'center' }, `שלום ${user.display_name}! 👋`),
+    mascot('אני ינשופי. נקרא ונכתוב ביחד — לאט, בכיף, ובלי לחץ. רק עוד שתי שאלות קטנות:'),
+    h('div', { class: 'card stack' },
+      h('div', { class: 'field' }, h('label', {}, 'איך לפנות אליך?'), seg([['m', '👦 בן'], ['f', '👧 בת']], p.gender, v => { p.gender = v; })),
+      h('div', { class: 'field' }, h('label', {}, 'בחר/י דמות'), avatarPicker(p.avatar, a => { p.avatar = a; }))),
+    err, btn);
 };
 
-routes.register = () => {
-  const p = { gender: 'm', avatar: '🦊' };
-  const name = h('input', { type: 'text', placeholder: 'השם שלי (בעברית)', maxlength: 30, autocomplete: 'off' });
-  const u = h('input', { type: 'text', placeholder: 'למשל: noam10', autocomplete: 'username', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none', spellcheck: 'false' });
-  const pw = pwField('לפחות 4 תווים', 'new-password');
-  const pw2 = pwField('שוב את אותה סיסמה', 'new-password');
-  const err = errBox();
-  const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'יאללה, נרשמים! 🚀');
-  const form = h('form', { class: 'card stack', onsubmit: async e => {
-    e.preventDefault();
-    if (!name.value.trim()) { showErr(err, 'כתבו את השם שלכם'); return; }
-    if (pw.inp.value !== pw2.inp.value) { showErr(err, 'שתי הסיסמאות לא זהות'); return; }
-    busy(btn, true, 'נרשמים...');
-    try {
-      await afterLogin(await API.call('/register', { method: 'POST', body: { display_name: name.value.trim(), username: u.value.trim(), password: pw.inp.value, gender: p.gender, avatar: p.avatar } }));
-    } catch (ex) { showErr(err, ex.message); busy(btn, false, 'יאללה, נרשמים! 🚀'); }
-  } },
-    h('div', { class: 'field' }, h('label', {}, 'איך קוראים לך?'), name),
-    h('div', { class: 'field' }, h('label', {}, 'איך לפנות אליך?'), seg([['m', '👦 בן'], ['f', '👧 בת']], p.gender, v => { p.gender = v; })),
-    h('div', { class: 'field' }, h('label', {}, 'בחר/י דמות'), avatarPicker(p.avatar, a => { p.avatar = a; })),
-    h('div', { class: 'field' }, h('label', {}, 'שם משתמש (באנגלית)'), u,
-      h('div', { class: 'muted' }, 'אותיות באנגלית או מספרים, לפחות 3. כדאי שהורה יעזור ויזכור.')),
-    h('div', { class: 'field' }, h('label', {}, 'סיסמה'), pw.el),
-    h('div', { class: 'field' }, h('label', {}, 'אימות סיסמה'), pw2.el),
-    err, btn);
-  return h('div', { class: 'stack' },
-    h('div', { class: 'topbar' }, h('button', { class: 'icon-btn btn-ghost', 'aria-label': 'חזרה', onclick: () => location.hash = '#/login' }, '→'), h('div', { class: 'title' }, '✨ הרשמה')),
-    mascot('נעים מאוד! בוא/י נכין לך משתמש — ככה ההתקדמות נשמרת גם בטלפון וגם במחשב.'),
-    form,
-    h('div', { class: 'center' }, 'כבר יש לך משתמש? ', h('a', { href: '#/login', style: 'color:var(--primary);font-weight:700' }, 'לכניסה')));
-};
 
 routes.password = () => {
   const forced = !!user?.must_change;
@@ -1452,7 +1551,7 @@ async function adminList(body) {
   const nu = { gender: 'm', role: 'student' };
   const nName = h('input', { type: 'text', placeholder: 'שם (בעברית)' });
   const nUser = h('input', { type: 'text', placeholder: 'שם משתמש (באנגלית)', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none' });
-  const nPw = h('input', { type: 'text', placeholder: 'סיסמה (לפחות 4 תווים)', dir: 'ltr', style: 'text-align:right' });
+  const nPw = h('input', { type: 'text', placeholder: 'סיסמה (לפחות 6 תווים)', dir: 'ltr', style: 'text-align:right' });
   const err = errBox();
 
   body.replaceChildren(
@@ -1463,19 +1562,23 @@ async function adminList(body) {
       h('div', { class: 'stat' }, h('b', {}, users.reduce((a, u) => a + u.minutes, 0)), 'דקות')),
     h('div', { class: 'card stack' }, h('h3', {}, '⚙️ הגדרות'),
       h('div', { class: 'field' }, h('label', {}, 'הרשמה עצמית במסך הכניסה'),
-        seg([[true, 'פתוחה'], [false, 'סגורה']], settings.registration, v => act(() => API.call('/admin/settings', { method: 'PUT', body: { registration: v } }), 'נשמר ✓')))),
+        seg([[true, 'פתוחה'], [false, 'סגורה']], settings.registration, v => act(() => API.call('/admin/settings', { method: 'PUT', body: { registration: v } }), 'נשמר ✓'))),
+      h('div', { class: 'field' }, h('label', {}, 'משתמש חדש צריך אישור מנהל'),
+        seg([[false, 'לא'], [true, 'כן']], settings.approval, v => act(() => API.call('/admin/settings', { method: 'PUT', body: { approval: v } }), 'נשמר ✓')))),
+    users.some(u => u.approved === 0) ? h('div', { class: 'tip' }, `⏳ ${users.filter(u => u.approved === 0).length} משתמשים ממתינים לאישור`) : null,
     h('div', { class: 'card stack' }, h('h3', {}, '👥 משתמשים'),
       users.map(u => h('div', { class: 'card stack', style: 'background:var(--bg);box-shadow:none' + (u.blocked ? ';opacity:.6' : '') },
         h('div', { class: 'row between' },
           h('div', { class: 'row' }, h('span', { style: 'font-size:32px' }, u.avatar),
-            h('div', {}, h('b', {}, u.display_name), u.role === 'admin' ? ' 🛡️' : '', u.blocked ? ' 🚫' : '',
+            h('div', {}, h('b', {}, u.display_name), u.role === 'admin' ? ' 🛡️' : '', u.blocked ? ' 🚫' : '', u.approved === 0 ? ' ⏳ ממתין לאישור' : '',
               h('div', { class: 'muted', dir: 'ltr', style: 'text-align:right' }, u.username))),
           h('button', { class: 'btn-small', onclick: () => location.hash = `#/admin/user/${u.id}` }, '📈 התקדמות')),
         h('div', { class: 'muted' }, `⭐ ${u.stars} · 📖 ${u.reads} קריאות · ☀️ ${u.days} ימים · ⏱️ ${u.minutes} דק׳ · 📕 ${u.stories} סיפורים`),
         h('div', { class: 'muted' }, `נרשם: ${fmtDate(u.created_at)} · פעיל לאחרונה: ${fmtDate(u.last_active)}`),
         u.id === me ? h('div', { class: 'muted' }, '(זה המשתמש שלך)') : h('div', { class: 'row' },
+          u.approved === 0 ? h('button', { class: 'btn-small btn-green', onclick: () => patch(u, { approved: true }, 'אושר ✓') }, '✓ אישור') : null,
           h('button', { class: 'btn-small btn-ghost', onclick: () => {
-            const p = prompt(`סיסמה חדשה ל-${u.username} (לפחות 4 תווים):`); if (p) patch(u, { password: p }, 'הסיסמה עודכנה ✓');
+            const p = prompt(`סיסמה חדשה ל-${u.username} (לפחות 6 תווים):`); if (p) patch(u, { password: p }, 'הסיסמה עודכנה ✓');
           } }, '🔑 סיסמה'),
           h('button', { class: 'btn-small btn-ghost', onclick: () => patch(u, { role: u.role === 'admin' ? 'student' : 'admin' }, 'עודכן ✓') }, u.role === 'admin' ? 'להפוך לתלמיד' : 'להפוך למנהל'),
           h('button', { class: 'btn-small btn-ghost', onclick: () => patch(u, { blocked: !u.blocked }, 'עודכן ✓') }, u.blocked ? 'ביטול חסימה' : '🚫 חסימה'),
@@ -1515,6 +1618,8 @@ async function adminUser(body, id) {
 /* ================= boot ================= */
 async function boot() {
   TTS.init();
+  app.replaceChildren(h('div', { class: 'center muted', style: 'padding:60px' }, 'טוען... ⏳'));
+  await loadConfig();
   try { user = await API.call('/me'); }
   catch (e) { user = e.status === 0 || e.status >= 500 ? readLocal('kria.user') : null; } // offline: keep the last login
   if (user) { try { localStorage.setItem('kria.user', JSON.stringify(user)); } catch { } }

@@ -70,6 +70,11 @@ async function init(env) {
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS reg_log (ip TEXT NOT NULL, ts INTEGER NOT NULL)`),
   ]);
+  // משתמש שנרשם בעצמו ממתין לאישור מנהל (כשהאפשרות פעילה). משתמשים קיימים מאושרים.
+  const cols = (await env.DB.prepare("PRAGMA table_info(users)").all()).results.map((c) => c.name);
+  if (!cols.includes("approved")) {
+    try { await env.DB.prepare("ALTER TABLE users ADD COLUMN approved INTEGER NOT NULL DEFAULT 1").run(); } catch {}
+  }
   // מנהל ראשוני: admin / admin — חובה להחליף סיסמה בכניסה הראשונה (האתר ציבורי)
   const { n } = await env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").first();
   if (n === 0) {
@@ -81,7 +86,7 @@ async function init(env) {
   ready = true;
 }
 
-const DEFAULT_SETTINGS = { registration: true };
+const DEFAULT_SETTINGS = { registration: true, approval: false };
 async function getSettings(env) {
   const { results } = await env.DB.prepare("SELECT key, value FROM settings").all();
   const out = { ...DEFAULT_SETTINGS };
@@ -114,7 +119,7 @@ async function currentUser(env, request) {
   const user = await env.DB.prepare(
     "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
   ).bind(await sha256(sid), Date.now()).first();
-  return !user || user.blocked ? null : user;
+  return !user || user.blocked || user.approved === 0 ? null : user;
 }
 const publicUser = (u) => ({
   id: u.id, username: u.username, display_name: u.display_name, gender: u.gender, avatar: u.avatar,
@@ -127,7 +132,7 @@ async function readBody(request) {
 const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,30}$/;
 const USERNAME_ERR = "שם משתמש: 3–30 תווים באנגלית או ספרות (אפשר גם נקודה, מקף, קו תחתון)";
 const validPassword = (p, username) => {
-  if (typeof p !== "string" || p.length < 4) return "הסיסמה צריכה להיות לפחות 4 תווים";
+  if (typeof p !== "string" || p.length < 6) return "הסיסמה חייבת להכיל לפחות 6 תווים";
   if (p.length > 100) return "הסיסמה ארוכה מדי";
   if (p.toLowerCase() === "admin" || p.toLowerCase() === String(username).toLowerCase()) return "בחרו סיסמה אחרת – זו קלה מדי לניחוש";
   return null;
@@ -172,12 +177,13 @@ export async function onRequest(context) {
         return fail("שם משתמש או סיסמה לא נכונים", 401);
       }
       if (user.blocked) return fail("המשתמש חסום. פנו למנהל.", 403);
+      if (user.approved === 0) return fail("המשתמש עוד ממתין לאישור המנהל. נסו שוב מאוחר יותר.", 403);
       return startSession(env, request, user, remember !== false);
     }
 
     if (path === "/config" && method === "GET") {
       const st = await getSettings(env);
-      return json({ registration: st.registration });
+      return json({ registration: st.registration, approval: st.approval });
     }
 
     if (path === "/register" && method === "POST") {
@@ -199,11 +205,12 @@ export async function onRequest(context) {
       const h = await hashPassword(b.password);
       const now = Date.now();
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO users (username, display_name, gender, avatar, pass_hash, salt, role, created_at) VALUES (?, ?, ?, ?, ?, ?, 'student', ?)")
-          .bind(username, display, cleanGender(b.gender), cleanAvatar(b.avatar), h.hash, h.salt, now),
+        env.DB.prepare("INSERT INTO users (username, display_name, gender, avatar, pass_hash, salt, role, approved, created_at) VALUES (?, ?, ?, ?, ?, ?, 'student', ?, ?)")
+          .bind(username, display, cleanGender(b.gender), cleanAvatar(b.avatar), h.hash, h.salt, st.approval ? 0 : 1, now),
         env.DB.prepare("INSERT INTO reg_log (ip, ts) VALUES (?, ?)").bind(ip, now),
         env.DB.prepare("DELETE FROM reg_log WHERE ts < ?").bind(hourAgo),
       ]);
+      if (st.approval) return json({ pending: true }, 201);
       const user = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(username).first();
       return startSession(env, request, user);
     }
@@ -278,7 +285,7 @@ export async function onRequest(context) {
 
       if (path === "/admin/users" && method === "GET") {
         const { results } = await env.DB.prepare(`
-          SELECT u.id, u.username, u.display_name, u.gender, u.avatar, u.role, u.blocked, u.must_change, u.created_at, u.last_active,
+          SELECT u.id, u.username, u.display_name, u.gender, u.avatar, u.role, u.blocked, u.must_change, u.approved, u.created_at, u.last_active,
                  COALESCE(p.stars,0) AS stars, COALESCE(p.reads,0) AS reads, COALESCE(p.days,0) AS days,
                  COALESCE(p.minutes,0) AS minutes, COALESCE(p.stories,0) AS stories, p.last_day
           FROM users u LEFT JOIN progress p ON p.user_id = u.id ORDER BY u.created_at`).all();
@@ -355,6 +362,7 @@ export async function onRequest(context) {
             stmts.push(env.DB.prepare("UPDATE users SET pass_hash = ?, salt = ?, failed = 0, locked_until = 0 WHERE id = ?").bind(h.hash, h.salt, id));
             stmts.push(env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id));
           }
+          if (b.approved === true) stmts.push(env.DB.prepare("UPDATE users SET approved = 1 WHERE id = ?").bind(id));
           if (b.reset_progress) stmts.push(env.DB.prepare("DELETE FROM progress WHERE user_id = ?").bind(id));
           if (!stmts.length) return fail("אין מה לעדכן");
           await env.DB.batch(stmts);
