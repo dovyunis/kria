@@ -212,23 +212,44 @@ function seg(options, value, onChange) {
 }
 
 /* ================= audio: TTS, playback, recording ================= */
+/* Hebrew voices: Android reports the language as "he_IL" / "iw_IL" (underscore, old "iw" code),
+   iOS / desktop as "he-IL". Voices load late on phones, and some phones list none even though the
+   engine speaks Hebrew — so we never refuse to speak: without a listed voice we just ask for lang he-IL. */
+const HE_LANG = /^(he|iw)([-_]|$)/i;
+const HE_NAME = /hebrew|עברית|carmit|hila|avri|asaf|osnat/i;
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const TTS = {
-  voices: [], voice: null,
+  voices: [], all: [], voice: null, current: null, lastCancel: 0, failed: 0,
+  supported: () => 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window,
+  pick() {
+    if (!this.supported()) return;
+    try { this.all = speechSynthesis.getVoices() || []; } catch { this.all = []; }
+    this.voices = this.all.filter(v => HE_LANG.test(v.lang || '') || HE_NAME.test(v.name || ''));
+    this.voice = this.voices.find(v => v.name === state.settings.voice) || this.voices.find(v => v.localService) || this.voices[0] || null;
+  },
   init() {
-    if (!('speechSynthesis' in window)) return;
-    const pickVoice = () => {
-      this.voices = speechSynthesis.getVoices().filter(v => /^(he|iw)\b/i.test(v.lang));
-      this.voice = this.voices.find(v => v.name === state.settings.voice) || this.voices.find(v => v.localService) || this.voices[0] || null;
+    if (!this.supported()) return;
+    this.pick();
+    speechSynthesis.onvoiceschanged = () => this.pick();
+    // some Android browsers never fire voiceschanged: ask again for a few seconds
+    let n = 0; const t = setInterval(() => { this.pick(); if (this.voices.length || ++n > 20) clearInterval(t); }, 300);
+    // iOS: the first utterance must come from a touch — unlock speech on the first tap anywhere
+    const unlock = () => {
+      try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; u.lang = 'he-IL'; speechSynthesis.speak(u); } catch { }
+      document.removeEventListener('touchend', unlock); document.removeEventListener('click', unlock);
     };
-    pickVoice();
-    speechSynthesis.addEventListener?.('voiceschanged', pickVoice);
+    document.addEventListener('touchend', unlock, { once: true }); document.addEventListener('click', unlock, { once: true });
   },
   speak(text, { onword, rate } = {}) {
     return new Promise(res => {
-      if (!this.voice) { res(false); return; }
+      if (!this.supported()) { noVoiceWarning(); res(false); return; }
+      if (!this.voice) this.pick();
       const spoken = state.settings.ttsNikud ? text : strip(text);
       const u = new SpeechSynthesisUtterance(spoken);
-      u.voice = this.voice; u.lang = this.voice.lang; u.rate = rate || state.settings.rate;
+      u.lang = (this.voice?.lang || 'he-IL').replace('_', '-');
+      if (this.voice) u.voice = this.voice;
+      u.rate = rate || state.settings.rate;
+      this.current = u; // keep a reference: Chrome drops events of garbage-collected utterances
       if (onword) {
         const starts = []; let pos = 0;
         for (const w of spoken.split(' ')) { starts.push(pos); pos += w.length + 1; }
@@ -239,17 +260,25 @@ const TTS = {
         };
       }
       let done = false; const fin = ok => { if (!done) { done = true; res(ok); } };
-      u.onend = () => fin(true); u.onerror = () => fin(false);
+      u.onstart = () => { this.failed = 0; };
+      u.onend = () => fin(true);
+      u.onerror = e => {
+        // 'interrupted' / 'canceled' = we stopped it on purpose; anything else is a real failure
+        if (e && !['interrupted', 'canceled'].includes(e.error)) { this.failed++; if (this.failed >= 2) noVoiceWarning(e.error); }
+        fin(false);
+      };
       // Safety net: some engines never fire onend
       setTimeout(() => fin(true), 2500 + spoken.length * 160 / (u.rate || 1));
-      speechSynthesis.speak(u);
+      const go = () => { try { speechSynthesis.resume(); } catch { } speechSynthesis.speak(u); };
+      // Android Chrome drops an utterance spoken right after cancel(); iOS needs it inside the tap, so no delay there
+      if (!isIOS() && Date.now() - this.lastCancel < 150) setTimeout(go, 150); else go();
     });
   }
 };
 let curAudio = null, playToken = 0, warnedNoVoice = false;
 function stopAll() {
   playToken++;
-  try { speechSynthesis.cancel(); } catch { }
+  try { if (speechSynthesis.speaking || speechSynthesis.pending) { speechSynthesis.cancel(); TTS.lastCancel = Date.now(); } } catch { }
   if (curAudio) { curAudio.pause(); curAudio = null; }
   document.querySelectorAll('.speaking').forEach(e => e.classList.remove('speaking'));
   document.querySelectorAll('.wspeak').forEach(e => e.classList.remove('wspeak'));
@@ -262,13 +291,14 @@ function playBlob(blob) {
     a.play().catch(() => res(false));
   });
 }
-function noVoiceWarning() {
+function noVoiceWarning(reason) {
   if (warnedNoVoice) return; warnedNoVoice = true;
-  toast('במכשיר הזה אין קול בעברית. הורה יכול להקליט קריאה באזור ההורים 🎙️', 5000);
+  toast(!TTS.supported() ? 'הדפדפן הזה לא תומך בהקראה. נסו Chrome או Safari, או הקליטו קריאה באזור ההורים 🎙️'
+    : 'ההקראה לא הצליחה. בדקו שהעוצמה פתוחה ושיש קול עברי בהגדרות "המרת טקסט לדיבור" בטלפון. בדיקה מלאה: אזור הורים ← הגדרות 🎙️', 7000);
+  console.warn('TTS failed:', reason);
 }
 async function say(text) {
   stopAll();
-  if (!TTS.voice) { noVoiceWarning(); return false; }
   return TTS.speak(text);
 }
 
@@ -386,11 +416,11 @@ async function readSentence(text, i, reader) {
   let ok;
   const m = models[`${text.id}:${i}`];
   if (m) ok = await playBlob(m.blob);
-  else if (TTS.voice) {
+  else {
     const ws = el ? [...el.querySelectorAll('.w')] : [];
     ok = await TTS.speak(s, { onword: wi => { ws.forEach(w => w.classList.remove('wspeak')); ws[wi]?.classList.add('wspeak'); } });
     ws.forEach(w => w.classList.remove('wspeak'));
-  } else { noVoiceWarning(); ok = false; }
+  }
   el?.classList.remove('speaking');
   return ok;
 }
@@ -914,7 +944,6 @@ routes.read = id => {
             h('button', { class: 'icon-btn btn-ghost', 'aria-label': 'השמעת השאלה', onclick: async () => {
               stopAll(); const tok = playToken;
               for (const s of [q.q, ...order.map(i => q.options[i])]) { if (tok !== playToken) break; await TTS.speak(s); await wait(250); }
-              if (!TTS.voice) noVoiceWarning();
             } }, '🔊')),
           opts),
         msg, findBtn, textBox);
@@ -1488,8 +1517,30 @@ function pWriting(body) {
 
 function pPrefs(body) {
   const name = h('input', { type: 'text', value: state.profile.name });
-  const voiceSel = h('select', {}, TTS.voices.length ? TTS.voices.map(v => h('option', { value: v.name, selected: v === TTS.voice }, `${v.name} (${v.lang})`)) : h('option', {}, 'לא נמצא קול עברי במכשיר'));
-  voiceSel.addEventListener('change', () => { state.settings.voice = voiceSel.value; save(); TTS.voice = TTS.voices.find(v => v.name === voiceSel.value) || TTS.voice; });
+  TTS.pick();
+  const voiceSel = h('select', {},
+    TTS.voices.map(v => h('option', { value: v.name, selected: v === TTS.voice }, `${v.name} (${v.lang})`)),
+    h('option', { value: '', selected: !TTS.voice }, 'ברירת המחדל של הטלפון לעברית'));
+  voiceSel.addEventListener('change', () => {
+    state.settings.voice = voiceSel.value; save();
+    TTS.voice = TTS.voices.find(v => v.name === voiceSel.value) || null;
+  });
+  const diag = h('div', { class: 'muted', style: 'font-size:14px' });
+  const showDiag = (result) => diag.replaceChildren(
+    h('div', {}, TTS.supported() ? `קולות במכשיר: ${TTS.all.length} · קולות בעברית: ${TTS.voices.length}` : 'הדפדפן הזה לא תומך בהקראה (speechSynthesis)'),
+    h('div', {}, `בשימוש: ${TTS.voice ? `${TTS.voice.name} (${TTS.voice.lang})` : 'ברירת המחדל של הטלפון לעברית (he-IL)'}`),
+    result ? h('div', { style: `font-weight:700;color:var(${result.ok ? '--green' : '--orange'})` }, result.text) : null);
+  showDiag();
+  const testVoice = async () => {
+    showDiag({ ok: true, text: '⏳ מנגן...' });
+    stopAll();
+    const t0 = Date.now();
+    const ok = await TTS.speak('שָׁלוֹם! אֲנִי יַנְשׁוּפִי, וַאֲנִי אוֹהֵב לִקְרוֹא סִיפּוּרִים.');
+    TTS.pick();
+    showDiag(ok && Date.now() - t0 > 700
+      ? { ok: true, text: '✅ ההקראה עובדת. לא שמעתם? בדקו שהעוצמה פתוחה (ובאייפון – שמתג השקט כבוי).' }
+      : { ok: false, text: '⚠️ ההקראה לא התנגנה. באנדרואיד: הגדרות ← נגישות / ניהול כללי ← "המרת טקסט לדיבור" ← בחרו מנוע Google והורידו את העברית. אפשר גם להקליט את עצמכם בלשונית טקסטים.' });
+  };
   body.append(
     h('div', { class: 'card stack' }, h('h3', {}, '👤 פרופיל'),
       h('p', { class: 'muted' }, `משתמש: ${user?.username || ''}`),
@@ -1507,10 +1558,11 @@ function pPrefs(body) {
         h('button', { class: 'btn-small btn-ghost', onclick: () => location.hash = '#/password' }, '🔐 החלפת סיסמה'))),
     h('div', { class: 'card stack' }, h('h3', {}, '🔊 קול'),
       h('div', { class: 'field' }, h('label', {}, 'קול עברי'), voiceSel),
+      diag,
+      h('button', { class: 'btn-small btn-blue', onclick: testVoice }, '▶ בדיקת קול'),
       h('div', { class: 'field' }, h('label', {}, 'מהירות הקראה'), seg([[0.6, 'איטי מאוד'], [0.75, 'איטי'], [0.85, 'רגיל-איטי'], [1, 'רגיל']], state.settings.rate, v => { state.settings.rate = v; save(); })),
       h('div', { class: 'field' }, h('label', {}, 'לשלוח ניקוד למנוע הקול'), seg([[true, 'כן'], [false, 'לא']], state.settings.ttsNikud, v => { state.settings.ttsNikud = v; save(); })),
-      h('p', { class: 'muted' }, 'אם הקול הממוחשב מבטא מילים לא נכון, נסו לשנות את האפשרות הזאת, או הקליטו את עצמכם (בלשונית טקסטים).'),
-      h('button', { class: 'btn-small btn-blue', onclick: () => say('שָׁלוֹם! אֲנִי יַנְשׁוּפִי, וַאֲנִי אוֹהֵב לִקְרוֹא סִיפּוּרִים.') }, '▶ בדיקת קול')),
+      h('p', { class: 'muted' }, 'אם הקול הממוחשב מבטא מילים לא נכון, נסו לשנות את האפשרות הזאת, או הקליטו את עצמכם (בלשונית טקסטים).')),
     h('div', { class: 'card stack' }, h('h3', {}, '🎯 מטרות והקלטה'),
       h('div', { class: 'field' }, h('label', {}, 'ימי תרגול בשבוע (מטרה)'), seg([[3, '3'], [4, '4'], [5, '5'], [6, '6']], state.weeklyGoal, v => { state.weeklyGoal = v; save(); })),
       h('div', { class: 'field' }, h('label', {}, 'הקלטת הילד/ה בקריאה לבד'), seg([[true, 'פעיל'], [false, 'כבוי']], state.settings.record, v => { state.settings.record = v; save(); })),

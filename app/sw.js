@@ -1,6 +1,6 @@
 // Offline support: app files are network-first with a cache fallback,
 // Google Fonts are cached at runtime so the app works offline after the first visit.
-const CACHE = 'kria-v5';
+const CACHE = 'kria-v6';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'content.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png'];
 
