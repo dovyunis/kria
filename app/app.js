@@ -35,21 +35,99 @@ const todayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() +
 const wordsOf = s => String(s).trim().split(/\s+/).filter(Boolean);
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-/* ================= state ================= */
-const KEY = 'kria.v1';
+/* ================= server API & login ================= */
+const API = {
+  async call(path, { method = 'GET', body } = {}) {
+    let r;
+    try {
+      r = await fetch('/api' + path, { method, credentials: 'same-origin',
+        headers: body ? { 'content-type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
+    } catch { const e = new Error('אין חיבור לאינטרנט'); e.status = 0; throw e; }
+    let data = {};
+    try { data = await r.json(); } catch { }
+    if (!r.ok) { const e = new Error(data.error || 'משהו השתבש, נסו שוב'); e.status = r.status; throw e; }
+    return data;
+  }
+};
+let user = null; // { id, username, display_name, gender, avatar, role, must_change }
+const isAdmin = () => user?.role === 'admin';
+
+/* ================= state (per user, cached on device, synced to server) ================= */
+const LEGACY_KEY = 'kria.v1';
+const userKey = () => `kria.u.${user?.id ?? 'guest'}`;
 const DEFAULTS = {
   profile: { name: '', gender: 'm', avatar: '🦊' },
   settings: { nikud: 'full', size: 26, spacing: 1, rate: 0.85, voice: '', ttsNikud: true, record: true },
   weeklyGoal: 4,
   stars: 0, stickers: [],
-  days: {}, reads: {}, games: {}, dict: [], stories: [], answers: [], custom: []
+  days: {}, reads: {}, games: {}, dict: [], stories: [], answers: [], custom: [],
+  updatedAt: 0
 };
-let state;
-try { state = JSON.parse(localStorage.getItem(KEY)) || {}; } catch { state = {}; }
-state = { ...structuredClone(DEFAULTS), ...state,
-  profile: { ...DEFAULTS.profile, ...(state.profile || {}) },
-  settings: { ...DEFAULTS.settings, ...(state.settings || {}) } };
-function save() { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { console.warn(e); } }
+function normalize(s) {
+  s = s && typeof s === 'object' ? s : {};
+  return { ...structuredClone(DEFAULTS), ...s,
+    profile: { ...DEFAULTS.profile, ...(s.profile || {}) },
+    settings: { ...DEFAULTS.settings, ...(s.settings || {}) } };
+}
+let state = normalize({});
+function readLocal(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } }
+function save() {
+  state.updatedAt = Date.now();
+  try { localStorage.setItem(userKey(), JSON.stringify(state)); } catch (e) { console.warn(e); }
+  scheduleSync();
+}
+
+let syncTimer = null, dirty = false;
+function scheduleSync() {
+  if (!user || user.must_change) return;
+  dirty = true; clearTimeout(syncTimer); syncTimer = setTimeout(pushProgress, 4000);
+}
+async function pushProgress() {
+  if (!user || user.must_change || !dirty) return;
+  dirty = false;
+  try { await API.call('/progress', { method: 'PUT', body: { data: state } }); }
+  catch (e) { dirty = true; if (e.status === 401) { user = null; render(); } }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && dirty && user && !user.must_change) {
+    dirty = false;
+    fetch('/api/progress', { method: 'PUT', keepalive: true, credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ data: state }) }).catch(() => { dirty = true; });
+  }
+});
+window.addEventListener('online', () => { if (dirty) pushProgress(); });
+
+/* After login: take the newer of the device copy and the server copy */
+async function loadUserState() {
+  const local = readLocal(userKey());
+  let server = null, serverAt = 0, fetched = false;
+  try { const r = await API.call('/progress'); server = r.data; serverAt = r.updated_at || 0; fetched = true; } catch { }
+  let chosen = local && (local.updatedAt || 0) > serverAt ? local : (server || local);
+  // first login of a child on a device that was used before accounts existed: adopt that progress
+  if (!chosen && !isAdmin()) {
+    const legacy = readLocal(LEGACY_KEY);
+    if (legacy && (legacy.stars || Object.keys(legacy.days || {}).length)) { chosen = legacy; localStorage.removeItem(LEGACY_KEY); }
+  }
+  state = normalize(chosen);
+  state.profile = { ...state.profile, name: user.display_name, gender: user.gender, avatar: user.avatar };
+  applySettings();
+  try { localStorage.setItem(userKey(), JSON.stringify(state)); } catch { }
+  if (fetched && chosen && chosen !== server) { dirty = true; pushProgress(); }
+}
+async function afterLogin(u) {
+  user = u;
+  try { localStorage.setItem('kria.user', JSON.stringify(u)); } catch { }
+  if (!u.must_change) await loadUserState();
+  location.hash = u.must_change ? '#/password' : '#/home';
+  render();
+}
+async function logout() {
+  if (dirty) await pushProgress();
+  try { await API.call('/logout', { method: 'POST' }); } catch { }
+  user = null; parentOk = false; state = normalize({});
+  try { localStorage.removeItem('kria.user'); } catch { }
+  location.hash = '#/login'; render();
+}
 function day(k = todayKey()) { return state.days[k] || (state.days[k] = { mins: 0, acts: 0, did: {} }); }
 function markDid(kind) { const d = day(); d.acts++; d.did[kind] = true; save(); }
 
@@ -321,8 +399,11 @@ let current = '';
 const routes = {};
 function render() {
   stopAll(); Rec.cancel();
-  const [, name = 'home', ...args] = (location.hash || '#/home').split('/');
-  if (!state.profile.name && name !== 'onboard' && name !== 'parent') { location.hash = '#/onboard'; return; }
+  let [, name = 'home', ...args] = (location.hash || '#/home').split('/');
+  // not logged in: only login / register; must change password: only that screen
+  if (!user && name !== 'login' && name !== 'register') name = 'login';
+  else if (user?.must_change) name = 'password';
+  else if (user && (name === 'login' || name === 'register' || name === 'onboard')) name = 'home';
   current = name;
   app.replaceChildren();
   const fn = routes[name] || routes.home;
@@ -339,27 +420,111 @@ setInterval(() => {
   }
 }, 15000);
 
-/* ================= onboarding ================= */
-routes.onboard = () => {
-  const p = { ...state.profile };
-  const AV = ['🦊', '🐱', '🐶', '🐼', '🦁', '🐸', '🐵', '🦄', '🐯', '🐰', '🐨', '🐧'];
-  const name = h('input', { type: 'text', value: p.name, placeholder: 'השם שלי', maxlength: 20, autocomplete: 'off' });
-  const avs = h('div', { class: 'chips' }, AV.map(a => h('button', { class: 'chip' + (a === p.avatar ? ' sel' : ''), style: 'font-size:32px', onclick: e => {
-    p.avatar = a; avs.querySelectorAll('.chip').forEach(c => c.classList.remove('sel')); e.currentTarget.classList.add('sel');
+/* ================= login / register / password ================= */
+const AVATARS = ['🦊', '🐱', '🐶', '🐼', '🦁', '🐸', '🐵', '🦄', '🐯', '🐰', '🐨', '🐧'];
+function avatarPicker(cur, onPick) {
+  const avs = h('div', { class: 'chips' }, AVATARS.map(a => h('button', { type: 'button', class: 'chip' + (a === cur ? ' sel' : ''), style: 'font-size:32px', onclick: e => {
+    avs.querySelectorAll('.chip').forEach(c => c.classList.remove('sel')); e.currentTarget.classList.add('sel'); onPick(a);
   } }, a)));
+  return avs;
+}
+function pwField(placeholder, autocomplete) {
+  const inp = h('input', { type: 'password', placeholder, autocomplete, dir: 'ltr', style: 'text-align:right' });
+  const eye = h('button', { type: 'button', class: 'icon-btn btn-ghost', 'aria-label': 'הצגת סיסמה', onclick: () => {
+    inp.type = inp.type === 'password' ? 'text' : 'password'; eye.textContent = inp.type === 'password' ? '👁️' : '🙈';
+  } }, '👁️');
+  return { inp, el: h('div', { class: 'row', style: 'flex-wrap:nowrap' }, inp, eye) };
+}
+function errBox() { return h('div', { class: 'tip hidden', role: 'alert' }); }
+function showErr(box, msg) { box.textContent = '⚠️ ' + msg; box.classList.remove('hidden'); }
+function busy(btn, on, label) { btn.disabled = on; if (label) btn.textContent = label; }
+
+routes.login = () => {
+  const u = h('input', { type: 'text', placeholder: 'שם משתמש', autocomplete: 'username', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none', spellcheck: 'false' });
+  const pw = pwField('סיסמה', 'current-password');
+  const remember = h('input', { type: 'checkbox', checked: true, id: 'remember', style: 'width:22px;height:22px' });
+  const err = errBox();
+  const regLink = h('div', { class: 'center' });
+  const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'כניסה 🚀');
+  const form = h('form', { class: 'card stack', onsubmit: async e => {
+    e.preventDefault();
+    if (!u.value.trim() || !pw.inp.value) { showErr(err, 'צריך למלא שם משתמש וסיסמה'); return; }
+    busy(btn, true, 'נכנסים...');
+    try { await afterLogin(await API.call('/login', { method: 'POST', body: { username: u.value.trim(), password: pw.inp.value, remember: remember.checked } })); }
+    catch (ex) { showErr(err, ex.message); busy(btn, false, 'כניסה 🚀'); }
+  } },
+    h('div', { class: 'field' }, h('label', {}, 'שם משתמש'), u),
+    h('div', { class: 'field' }, h('label', {}, 'סיסמה'), pw.el),
+    h('label', { class: 'row', style: 'font-weight:400;cursor:pointer' }, remember, 'לזכור אותי במכשיר הזה'),
+    err, btn);
+  API.call('/config').then(c => {
+    if (c.registration) regLink.append(h('span', {}, 'אין לך משתמש עדיין? '), h('a', { href: '#/register', style: 'color:var(--primary);font-weight:700' }, 'להרשמה ✨'));
+  }).catch(() => {});
   return h('div', { class: 'stack' },
-    h('h1', { class: 'center' }, 'שלום! 👋'),
-    mascot('אני ינשופי. נקרא ונכתוב ביחד — לאט, בכיף, ובלי לחץ.'),
-    h('div', { class: 'card stack' },
-      h('div', { class: 'field' }, h('label', {}, 'איך קוראים לך?'), name),
-      h('div', { class: 'field' }, h('label', {}, 'איך לפנות אליך?'),
-        seg([['m', '👦 בן'], ['f', '👧 בת']], p.gender, v => { p.gender = v; })),
-      h('div', { class: 'field' }, h('label', {}, 'בחר/י דמות'), avs)),
-    h('button', { class: 'btn-big btn-full', onclick: () => {
-      p.name = name.value.trim();
-      if (!p.name) { name.focus(); name.classList.add('shake'); setTimeout(() => name.classList.remove('shake'), 400); return; }
-      state.profile = p; save(); location.hash = '#/home';
-    } }, 'יאללה, מתחילים! 🚀'));
+    h('div', { class: 'center', style: 'font-size:72px;line-height:1' }, '🦉'),
+    h('h1', { class: 'center' }, 'קוראים בכיף'),
+    mascot('שלום! אני ינשופי. נכנסים עם שם המשתמש והסיסמה.'),
+    form, regLink);
+};
+
+routes.register = () => {
+  const p = { gender: 'm', avatar: '🦊' };
+  const name = h('input', { type: 'text', placeholder: 'השם שלי (בעברית)', maxlength: 30, autocomplete: 'off' });
+  const u = h('input', { type: 'text', placeholder: 'למשל: noam10', autocomplete: 'username', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none', spellcheck: 'false' });
+  const pw = pwField('לפחות 4 תווים', 'new-password');
+  const pw2 = pwField('שוב את אותה סיסמה', 'new-password');
+  const err = errBox();
+  const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'יאללה, נרשמים! 🚀');
+  const form = h('form', { class: 'card stack', onsubmit: async e => {
+    e.preventDefault();
+    if (!name.value.trim()) { showErr(err, 'כתבו את השם שלכם'); return; }
+    if (pw.inp.value !== pw2.inp.value) { showErr(err, 'שתי הסיסמאות לא זהות'); return; }
+    busy(btn, true, 'נרשמים...');
+    try {
+      await afterLogin(await API.call('/register', { method: 'POST', body: { display_name: name.value.trim(), username: u.value.trim(), password: pw.inp.value, gender: p.gender, avatar: p.avatar } }));
+    } catch (ex) { showErr(err, ex.message); busy(btn, false, 'יאללה, נרשמים! 🚀'); }
+  } },
+    h('div', { class: 'field' }, h('label', {}, 'איך קוראים לך?'), name),
+    h('div', { class: 'field' }, h('label', {}, 'איך לפנות אליך?'), seg([['m', '👦 בן'], ['f', '👧 בת']], p.gender, v => { p.gender = v; })),
+    h('div', { class: 'field' }, h('label', {}, 'בחר/י דמות'), avatarPicker(p.avatar, a => { p.avatar = a; })),
+    h('div', { class: 'field' }, h('label', {}, 'שם משתמש (באנגלית)'), u,
+      h('div', { class: 'muted' }, 'אותיות באנגלית או מספרים, לפחות 3. כדאי שהורה יעזור ויזכור.')),
+    h('div', { class: 'field' }, h('label', {}, 'סיסמה'), pw.el),
+    h('div', { class: 'field' }, h('label', {}, 'אימות סיסמה'), pw2.el),
+    err, btn);
+  return h('div', { class: 'stack' },
+    h('div', { class: 'topbar' }, h('button', { class: 'icon-btn btn-ghost', 'aria-label': 'חזרה', onclick: () => location.hash = '#/login' }, '→'), h('div', { class: 'title' }, '✨ הרשמה')),
+    mascot('נעים מאוד! בוא/י נכין לך משתמש — ככה ההתקדמות נשמרת גם בטלפון וגם במחשב.'),
+    form,
+    h('div', { class: 'center' }, 'כבר יש לך משתמש? ', h('a', { href: '#/login', style: 'color:var(--primary);font-weight:700' }, 'לכניסה')));
+};
+
+routes.password = () => {
+  const forced = !!user?.must_change;
+  const cur = pwField('הסיסמה הנוכחית', 'current-password');
+  const nw = pwField('סיסמה חדשה', 'new-password');
+  const nw2 = pwField('שוב את הסיסמה החדשה', 'new-password');
+  const err = errBox();
+  const btn = h('button', { class: 'btn-big btn-full', type: 'submit' }, 'שמירה ✓');
+  const form = h('form', { class: 'card stack', onsubmit: async e => {
+    e.preventDefault();
+    if (nw.inp.value !== nw2.inp.value) { showErr(err, 'שתי הסיסמאות החדשות לא זהות'); return; }
+    busy(btn, true);
+    try {
+      await API.call('/password', { method: 'POST', body: { current: cur.inp.value, next: nw.inp.value } });
+      toast('הסיסמה הוחלפה ✓');
+      await afterLogin({ ...user, must_change: false });
+    } catch (ex) { showErr(err, ex.message); busy(btn, false); }
+  } },
+    h('div', { class: 'field' }, h('label', {}, 'סיסמה נוכחית'), cur.el),
+    h('div', { class: 'field' }, h('label', {}, 'סיסמה חדשה'), nw.el),
+    h('div', { class: 'field' }, h('label', {}, 'אימות'), nw2.el),
+    err, btn);
+  return h('div', { class: 'stack' },
+    forced ? h('h1', {}, '🔐 החלפת סיסמה') : topbar('🔐 החלפת סיסמה', '#/parent/prefs'),
+    forced ? h('div', { class: 'tip' }, 'זו הכניסה הראשונה עם הסיסמה הזמנית. כדי לשמור על האתר, בחרו עכשיו סיסמה חדשה (לא admin).') : null,
+    form,
+    forced ? h('button', { class: 'btn-ghost btn-small', onclick: logout }, 'יציאה') : null);
 };
 
 /* ================= home ================= */
@@ -419,7 +584,9 @@ routes.home = () => {
       h('div', { class: 'tile', onclick: () => location.hash = '#/stickers' }, h('div', { class: 'emo' }, '🏆'), 'המדבקות שלי', h('div', { class: 'sub' }, `${state.stickers.length} מדבקות`))),
     h('div', { class: 'row between', style: 'margin-top:20px' },
       h('button', { class: 'btn-ghost btn-small', onclick: () => location.hash = '#/settings' }, 'Aa תצוגה'),
-      h('button', { class: 'btn-ghost btn-small', onclick: () => location.hash = '#/parent' }, '👨‍👩‍👧 אזור הורים')));
+      isAdmin() ? h('button', { class: 'btn-small', onclick: () => location.hash = '#/admin' }, '🛡️ ניהול') : null,
+      h('button', { class: 'btn-ghost btn-small', onclick: () => location.hash = '#/parent' }, '👨‍👩‍👧 אזור הורים'),
+      h('button', { class: 'btn-ghost btn-small', onclick: logout }, `🚪 יציאה (${user?.username || ''})`)));
 };
 
 /* ================= quick display settings (child) ================= */
@@ -590,7 +757,7 @@ routes.read = id => {
       award('solo', 2);
       markDid('read');
       if (r) {
-        await DB.add({ kind: 'child', textId: text.id, title: strip(text.title), d: Date.now(), secs: r.secs, blob: r.blob }).catch(() => {});
+        await DB.add({ kind: 'child', uid: user?.id, textId: text.id, title: strip(text.title), d: Date.now(), secs: r.secs, blob: r.blob }).catch(() => {});
         after.append(h('button', { class: 'btn-big btn-blue btn-full', onclick: () => { stopAll(); playBlob(r.blob); } }, G('🎧 לשמוע את עצמי', '🎧 לשמוע את עצמי')));
       }
       after.append(mascot(G(`${praise()} קראת את כל הטקסט לבד!`, `${praise()} קראת את כל הטקסט לבד!`)), nextBtn());
@@ -1060,7 +1227,7 @@ routes.stickers = () => {
 /* ================= parent area ================= */
 let parentOk = false;
 routes.parent = (tab = 'progress') => {
-  if (!parentOk) {
+  if (!parentOk && !isAdmin()) {
     const a = 3 + Math.floor(Math.random() * 7), b = 6 + Math.floor(Math.random() * 4);
     const inp = h('input', { type: 'number', inputmode: 'numeric' });
     const go = () => { if (Number(inp.value) === a * b) { parentOk = true; render(); } else { inp.value = ''; inp.classList.add('shake'); setTimeout(() => inp.classList.remove('shake'), 400); } };
@@ -1077,34 +1244,34 @@ routes.parent = (tab = 'progress') => {
   return wrap;
 };
 
-function pProgress(body) {
+function pProgress(body, st = state) {
   const days = Array.from({ length: 14 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() - 13 + i); return d; });
-  const mins = days.map(d => state.days[todayKey(d)]?.mins || 0);
+  const mins = days.map(d => st.days[todayKey(d)]?.mins || 0);
   const max = Math.max(10, ...mins);
-  const totalMins = Object.values(state.days).reduce((a, d) => a + (d.mins || 0), 0);
-  const activeDays = Object.values(state.days).filter(d => d.acts > 0).length;
-  const totalReads = Object.values(state.reads).reduce((a, r) => a + r.length, 0);
+  const totalMins = Object.values(st.days).reduce((a, d) => a + (d.mins || 0), 0);
+  const activeDays = Object.values(st.days).filter(d => d.acts > 0).length;
+  const totalReads = Object.values(st.reads).reduce((a, r) => a + r.length, 0);
   body.append(
     h('div', { class: 'stats' },
       h('div', { class: 'stat' }, h('b', {}, activeDays), 'ימי תרגול'),
       h('div', { class: 'stat' }, h('b', {}, Math.round(totalMins)), 'דקות'),
       h('div', { class: 'stat' }, h('b', {}, totalReads), 'קריאות'),
-      h('div', { class: 'stat' }, h('b', {}, state.stars), 'כוכבים')),
+      h('div', { class: 'stat' }, h('b', {}, st.stars), 'כוכבים')),
     h('div', { class: 'card stack' }, h('h3', {}, 'דקות תרגול — 14 ימים אחרונים'),
       h('div', { class: 'bars' }, mins.map(m => h('div', { class: 'b', style: `height:${(m / max) * 100}%` }, h('span', {}, m ? Math.round(m) : '')))),
       h('div', { class: 'bar-labels' }, days.map(d => h('span', {}, `${d.getDate()}/${d.getMonth() + 1}`)))),
     h('div', { class: 'card stack' }, h('h3', {}, 'קריאה לבד (שלב 4)'),
       h('p', { class: 'muted' }, 'מילים לדקה מחושבות מהזמן שבין "התחלתי" ל"סיימתי". חשוב להשוות רק לקריאות קודמות של הילד/ה, ולא להציג לילד/ה. "עזרה" = כמה פעמים נלחצה מילה כדי לשמוע אותה.'),
       totalReads ? h('table', {}, h('tr', {}, h('th', {}, 'טקסט'), h('th', {}, 'תאריך'), h('th', {}, 'מילים/דקה'), h('th', {}, 'עזרה')),
-        Object.entries(state.reads).flatMap(([id, rs]) => rs.map((r, i) => h('tr', {},
+        Object.entries(st.reads).flatMap(([id, rs]) => rs.map((r, i) => h('tr', {},
           h('td', {}, i === 0 ? strip(getText(id)?.title || id) : (i + 1) + '×'),
           h('td', {}, new Date(r.d).toLocaleDateString('he-IL')), h('td', {}, r.wpm), h('td', {}, r.helps))))) : h('p', { class: 'muted' }, 'עוד אין קריאות.')),
     h('div', { class: 'card stack' }, h('h3', {}, 'משחקים'),
-      Object.keys(state.games).length ? h('table', {}, h('tr', {}, h('th', {}, 'משחק'), h('th', {}, 'סיבובים'), h('th', {}, 'נכון בניסיון ראשון')),
-        Object.entries(state.games).map(([k, g]) => h('tr', {}, h('td', {}, GAMES.find(x => x.id === k)?.name || k), h('td', {}, g.plays),
+      Object.keys(st.games).length ? h('table', {}, h('tr', {}, h('th', {}, 'משחק'), h('th', {}, 'סיבובים'), h('th', {}, 'נכון בניסיון ראשון')),
+        Object.entries(st.games).map(([k, g]) => h('tr', {}, h('td', {}, GAMES.find(x => x.id === k)?.name || k), h('td', {}, g.plays),
           h('td', {}, g.right + g.wrong ? Math.round(100 * g.right / (g.right + g.wrong)) + '%' : '—')))) : h('p', { class: 'muted' }, 'עוד לא שיחקו.')),
     h('div', { class: 'card stack' }, h('h3', {}, 'המילון האישי — מילים שהיו קשות בכתיב'),
-      state.dict.length ? h('div', { class: 'chips' }, state.dict.map(d => h('span', { class: 'chip' + (d.ok >= 2 ? ' ok' : '') }, `${d.w} (${d.ok}/${d.miss + d.ok})`)))
+      st.dict.length ? h('div', { class: 'chips' }, st.dict.map(d => h('span', { class: 'chip' + (d.ok >= 2 ? ' ok' : '') }, `${d.w} (${d.ok}/${d.miss + d.ok})`)))
         : h('p', { class: 'muted' }, 'עוד אין מילים.'),
       h('p', { class: 'muted' }, 'מילים שהילד/ה טעה/תה בהן במשחק "אותיות חברות" נכנסות לכאן, ומתורגלות במשחק "מסתכלים וכותבים". ירוק = נכתבה נכון לפחות פעמיים.')));
 }
@@ -1112,7 +1279,7 @@ function pProgress(body) {
 async function pRecs(body) {
   body.append(h('p', { class: 'muted' }, 'הקלטות הקריאה של הילד/ה (שלב "קוראים לבד"). נשמרות רק במכשיר הזה. כדאי להאזין יחד ולהגיד מה היה טוב.'));
   let recs = [];
-  try { recs = (await DB.all()).filter(r => r.kind === 'child').sort((a, b) => b.d - a.d); } catch { }
+  try { recs = (await DB.all()).filter(r => r.kind === 'child' && (r.uid == null || r.uid === user?.id)).sort((a, b) => b.d - a.d); } catch { }
   if (!recs.length) { body.append(h('p', {}, 'עוד אין הקלטות.')); return; }
   for (const r of recs) {
     const card = h('div', { class: 'card stack' },
@@ -1178,7 +1345,7 @@ function pTexts(body) {
 }
 
 routes.model = id => {
-  if (!parentOk) { location.hash = '#/parent'; return null; }
+  if (!parentOk && !isAdmin()) { location.hash = '#/parent'; return null; }
   const text = getText(id);
   if (!text) { location.hash = '#/parent/texts'; return null; }
   const list = h('div', { class: 'stack' });
@@ -1225,9 +1392,19 @@ function pPrefs(body) {
   voiceSel.addEventListener('change', () => { state.settings.voice = voiceSel.value; save(); TTS.voice = TTS.voices.find(v => v.name === voiceSel.value) || TTS.voice; });
   body.append(
     h('div', { class: 'card stack' }, h('h3', {}, '👤 פרופיל'),
+      h('p', { class: 'muted' }, `משתמש: ${user?.username || ''}`),
       h('div', { class: 'field' }, h('label', {}, 'שם'), name),
-      h('div', { class: 'field' }, h('label', {}, 'פנייה'), seg([['m', 'בן'], ['f', 'בת']], state.profile.gender, v => { state.profile.gender = v; save(); })),
-      h('button', { class: 'btn-small', onclick: () => { state.profile.name = name.value.trim() || state.profile.name; save(); toast('נשמר ✓'); } }, 'שמירת שם')),
+      h('div', { class: 'field' }, h('label', {}, 'פנייה'), seg([['m', 'בן'], ['f', 'בת']], state.profile.gender, v => { state.profile.gender = v; })),
+      h('div', { class: 'field' }, h('label', {}, 'דמות'), avatarPicker(state.profile.avatar, a => { state.profile.avatar = a; })),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn-small', onclick: async () => {
+          state.profile.name = name.value.trim() || state.profile.name; save();
+          try {
+            user = await API.call('/profile', { method: 'PUT', body: { display_name: state.profile.name, gender: state.profile.gender, avatar: state.profile.avatar } });
+            localStorage.setItem('kria.user', JSON.stringify(user)); toast('נשמר ✓');
+          } catch (e) { toast(e.message); }
+        } }, 'שמירת פרופיל'),
+        h('button', { class: 'btn-small btn-ghost', onclick: () => location.hash = '#/password' }, '🔐 החלפת סיסמה'))),
     h('div', { class: 'card stack' }, h('h3', {}, '🔊 קול'),
       h('div', { class: 'field' }, h('label', {}, 'קול עברי'), voiceSel),
       h('div', { class: 'field' }, h('label', {}, 'מהירות הקראה'), seg([[0.6, 'איטי מאוד'], [0.75, 'איטי'], [0.85, 'רגיל-איטי'], [1, 'רגיל']], state.settings.rate, v => { state.settings.rate = v; save(); })),
@@ -1239,7 +1416,7 @@ function pPrefs(body) {
       h('div', { class: 'field' }, h('label', {}, 'הקלטת הילד/ה בקריאה לבד'), seg([[true, 'פעיל'], [false, 'כבוי']], state.settings.record, v => { state.settings.record = v; save(); })),
       h('p', { class: 'muted' }, 'תצוגה (גודל אותיות, רווחים, ניקוד) — בכפתור "Aa תצוגה" במסך הבית.')),
     h('div', { class: 'card stack' }, h('h3', {}, '💾 גיבוי'),
-      h('p', { class: 'muted' }, 'הנתונים נשמרים רק בדפדפן הזה. אפשר להוריד קובץ גיבוי (בלי הקלטות).'),
+      h('p', { class: 'muted' }, 'ההתקדמות נשמרת בחשבון ומסתנכרנת בין מכשירים. ההקלטות נשמרות רק במכשיר שבו הוקלטו. אפשר גם להוריד קובץ גיבוי.'),
       h('div', { class: 'row' },
         h('button', { class: 'btn-small', onclick: () => {
           const a = h('a', { href: URL.createObjectURL(new Blob([JSON.stringify(state, null, 1)], { type: 'application/json' })), download: `kria-backup-${todayKey()}.json` });
@@ -1247,7 +1424,7 @@ function pPrefs(body) {
         } }, '⬇️ הורדת גיבוי'),
         h('label', { class: 'btn btn-small btn-ghost', style: 'margin:0' }, '⬆️ שחזור מגיבוי',
           h('input', { type: 'file', accept: 'application/json', class: 'hidden', onchange: async e => {
-            try { const s = JSON.parse(await e.target.files[0].text()); if (!s.profile) throw 0; state = { ...structuredClone(DEFAULTS), ...s }; save(); applySettings(); toast('שוחזר ✓'); render(); }
+            try { const s = JSON.parse(await e.target.files[0].text()); if (!s.profile) throw 0; state = normalize(s); save(); applySettings(); toast('שוחזר ✓'); render(); }
             catch { toast('הקובץ לא תקין'); }
           } })))),
     h('button', { class: 'btn-ghost btn-small', style: 'color:var(--orange)', onclick: () => {
@@ -1256,10 +1433,98 @@ function pPrefs(body) {
     } }, 'איפוס התקדמות'));
 }
 
+/* ================= admin ================= */
+const fmtDate = t => t ? new Date(t).toLocaleDateString('he-IL') : '—';
+routes.admin = (sub, id) => {
+  if (!isAdmin()) { location.hash = '#/home'; return null; }
+  const body = h('div', { class: 'stack' }, h('p', { class: 'muted' }, 'טוען...'));
+  const wrap = h('div', { class: 'stack' }, topbar(sub === 'user' ? '🛡️ ניהול · התקדמות' : '🛡️ ניהול משתמשים', sub === 'user' ? '#/admin' : '#/home'), body);
+  (sub === 'user' ? adminUser(body, Number(id)) : adminList(body)).catch(e => body.replaceChildren(h('div', { class: 'tip' }, '⚠️ ', e.message)));
+  return wrap;
+};
+
+async function adminList(body) {
+  const [{ users, me }, settings] = await Promise.all([API.call('/admin/users'), API.call('/admin/settings')]);
+  const act = async (fn, okMsg) => { try { await fn(); if (okMsg) toast(okMsg); render(); } catch (e) { toast(e.message); } };
+  const patch = (u, b, msg) => act(() => API.call(`/admin/users/${u.id}`, { method: 'PATCH', body: b }), msg);
+
+  // create user
+  const nu = { gender: 'm', role: 'student' };
+  const nName = h('input', { type: 'text', placeholder: 'שם (בעברית)' });
+  const nUser = h('input', { type: 'text', placeholder: 'שם משתמש (באנגלית)', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none' });
+  const nPw = h('input', { type: 'text', placeholder: 'סיסמה (לפחות 4 תווים)', dir: 'ltr', style: 'text-align:right' });
+  const err = errBox();
+
+  body.replaceChildren(
+    h('div', { class: 'stats' },
+      h('div', { class: 'stat' }, h('b', {}, users.length), 'משתמשים'),
+      h('div', { class: 'stat' }, h('b', {}, users.filter(u => u.last_day === todayKey()).length), 'תרגלו היום'),
+      h('div', { class: 'stat' }, h('b', {}, users.reduce((a, u) => a + u.reads, 0)), 'קריאות'),
+      h('div', { class: 'stat' }, h('b', {}, users.reduce((a, u) => a + u.minutes, 0)), 'דקות')),
+    h('div', { class: 'card stack' }, h('h3', {}, '⚙️ הגדרות'),
+      h('div', { class: 'field' }, h('label', {}, 'הרשמה עצמית במסך הכניסה'),
+        seg([[true, 'פתוחה'], [false, 'סגורה']], settings.registration, v => act(() => API.call('/admin/settings', { method: 'PUT', body: { registration: v } }), 'נשמר ✓')))),
+    h('div', { class: 'card stack' }, h('h3', {}, '👥 משתמשים'),
+      users.map(u => h('div', { class: 'card stack', style: 'background:var(--bg);box-shadow:none' + (u.blocked ? ';opacity:.6' : '') },
+        h('div', { class: 'row between' },
+          h('div', { class: 'row' }, h('span', { style: 'font-size:32px' }, u.avatar),
+            h('div', {}, h('b', {}, u.display_name), u.role === 'admin' ? ' 🛡️' : '', u.blocked ? ' 🚫' : '',
+              h('div', { class: 'muted', dir: 'ltr', style: 'text-align:right' }, u.username))),
+          h('button', { class: 'btn-small', onclick: () => location.hash = `#/admin/user/${u.id}` }, '📈 התקדמות')),
+        h('div', { class: 'muted' }, `⭐ ${u.stars} · 📖 ${u.reads} קריאות · ☀️ ${u.days} ימים · ⏱️ ${u.minutes} דק׳ · 📕 ${u.stories} סיפורים`),
+        h('div', { class: 'muted' }, `נרשם: ${fmtDate(u.created_at)} · פעיל לאחרונה: ${fmtDate(u.last_active)}`),
+        u.id === me ? h('div', { class: 'muted' }, '(זה המשתמש שלך)') : h('div', { class: 'row' },
+          h('button', { class: 'btn-small btn-ghost', onclick: () => {
+            const p = prompt(`סיסמה חדשה ל-${u.username} (לפחות 4 תווים):`); if (p) patch(u, { password: p }, 'הסיסמה עודכנה ✓');
+          } }, '🔑 סיסמה'),
+          h('button', { class: 'btn-small btn-ghost', onclick: () => patch(u, { role: u.role === 'admin' ? 'student' : 'admin' }, 'עודכן ✓') }, u.role === 'admin' ? 'להפוך לתלמיד' : 'להפוך למנהל'),
+          h('button', { class: 'btn-small btn-ghost', onclick: () => patch(u, { blocked: !u.blocked }, 'עודכן ✓') }, u.blocked ? 'ביטול חסימה' : '🚫 חסימה'),
+          h('button', { class: 'btn-small btn-ghost', style: 'color:var(--orange)', onclick: () => {
+            if (confirm(`למחוק את ${u.display_name} (${u.username}) וכל ההתקדמות שלו/ה? אי אפשר לבטל.`)) act(() => API.call(`/admin/users/${u.id}`, { method: 'DELETE' }), 'נמחק');
+          } }, '🗑 מחיקה'))))),
+    h('div', { class: 'card stack' }, h('h3', {}, '➕ הוספת משתמש'),
+      nName, nUser, nPw,
+      seg([['m', 'בן'], ['f', 'בת']], nu.gender, v => { nu.gender = v; }),
+      seg([['student', 'תלמיד/ה'], ['admin', 'מנהל/ת']], nu.role, v => { nu.role = v; }),
+      err,
+      h('button', { class: 'btn-green', onclick: async () => {
+        try {
+          await API.call('/admin/users', { method: 'POST', body: { display_name: nName.value.trim(), username: nUser.value.trim(), password: nPw.value, gender: nu.gender, role: nu.role } });
+          toast('המשתמש נוסף ✓'); render();
+        } catch (e) { showErr(err, e.message); }
+      } }, 'הוספה')));
+}
+
+async function adminUser(body, id) {
+  const [{ users }, { data }] = await Promise.all([API.call('/admin/users'), API.call(`/admin/users/${id}/progress`)]);
+  const u = users.find(x => x.id === id);
+  if (!u) throw new Error('המשתמש לא נמצא');
+  body.replaceChildren(h('div', { class: 'row' }, h('span', { style: 'font-size:40px' }, u.avatar), h('h2', { style: 'margin:0' }, u.display_name)));
+  if (!data) { body.append(h('p', {}, 'עוד אין התקדמות למשתמש הזה.')); return; }
+  const st = normalize(data);
+  pProgress(body, st);
+  if (st.answers.length || st.stories.length) {
+    body.append(h('h3', {}, '✏️ כתיבה'));
+    [...st.answers.map(a => ({ ...a, kind: `תגובה ל"${a.title}"` })), ...st.stories.map(s => ({ ...s, kind: `סיפור: ${s.title}` }))]
+      .sort((a, b) => b.d - a.d).forEach(it => body.append(h('div', { class: 'card stack' },
+        h('div', { class: 'row between' }, h('b', {}, it.kind), h('span', { class: 'muted' }, fmtDate(it.d))),
+        h('div', { style: 'font-family:var(--read);font-size:19px;white-space:pre-wrap;line-height:1.9' }, it.text))));
+  }
+}
+
 /* ================= boot ================= */
-applySettings();
-TTS.init();
-loadModels().then(render);
+async function boot() {
+  TTS.init();
+  try { user = await API.call('/me'); }
+  catch (e) { user = e.status === 0 || e.status >= 500 ? readLocal('kria.user') : null; } // offline: keep the last login
+  if (user) { try { localStorage.setItem('kria.user', JSON.stringify(user)); } catch { } }
+  else { try { localStorage.removeItem('kria.user'); } catch { } }
+  if (user && !user.must_change) await loadUserState();
+  applySettings();
+  await loadModels();
+  render();
+}
+boot();
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
 }

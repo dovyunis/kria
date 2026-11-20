@@ -1,6 +1,6 @@
 // Offline support: app files are network-first with a cache fallback,
 // Google Fonts are cached at runtime so the app works offline after the first visit.
-const CACHE = 'kria-v2';
+const CACHE = 'kria-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'content.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png'];
 
@@ -20,6 +20,7 @@ self.addEventListener('fetch', e => {
   const url = new URL(req.url);
   const isFont = url.host === 'fonts.googleapis.com' || url.host === 'fonts.gstatic.com';
   if (url.origin !== location.origin && !isFont) return;
+  if (url.origin === location.origin && url.pathname.startsWith('/api/')) return; // login & sync always go to the server
   e.respondWith(caches.open(CACHE).then(async cache => {
     const cached = await cache.match(req, { ignoreSearch: url.origin === location.origin });
     const fresh = fetch(req).then(res => {

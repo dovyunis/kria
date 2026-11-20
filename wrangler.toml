@@ -1,0 +1,8 @@
+name = "kriadov"
+pages_build_output_dir = "app"
+compatibility_date = "2025-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kria-db"
+database_id = "c846addf-6d29-442c-a5bf-bf2cd9ce9714"

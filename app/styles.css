@@ -183,7 +183,8 @@ button:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
 .qtext { font-family: var(--read); font-size: 23px; font-weight: 700; line-height: 1.8; }
 
 /* ---------- writing ---------- */
-textarea, input[type=text], input[type=number], select {
+input[type=password] { flex: 1; min-width: 0; }
+textarea, input[type=text], input[type=number], input[type=password], select {
   font: inherit; width: 100%; border: 3px solid var(--line); border-radius: 16px; padding: 12px 14px;
   background: #fffdf8; color: var(--ink);
 }
