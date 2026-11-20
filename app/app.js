@@ -684,6 +684,7 @@ routes.home = () => {
     h('div', { class: 'row between', style: 'margin-top:20px' },
       h('button', { class: 'btn-ghost btn-small', onclick: () => location.hash = '#/settings' }, 'Aa תצוגה'),
       isAdmin() ? h('button', { class: 'btn-small', onclick: () => location.hash = '#/admin' }, '🛡️ ניהול') : null,
+      isAdmin() ? h('button', { class: 'btn-small share-main', onclick: shareApp }, '📤 שיתוף') : null,
       h('button', { class: 'btn-ghost btn-small', onclick: () => location.hash = '#/parent' }, '👨‍👩‍👧 אזור הורים'),
       h('button', { class: 'btn-ghost btn-small', onclick: logout }, `🚪 יציאה (${user?.username || ''})`)));
 };
@@ -1532,6 +1533,39 @@ function pPrefs(body) {
     } }, 'איפוס התקדמות'));
 }
 
+/* ================= share / invite (same as LinguaDov) ================= */
+const shareUrl = () => `${location.origin}/#/register`;
+const defaultShareText = () =>
+  '🦉 בואו לקרוא ב"קוראים בכיף"! 📖\nתרגול קריאה וכתיבה בעברית לילדים בכיתות ג–ו — ינשופי מקריא, משחקי מילים וסיפורים, בלי לחץ. בחינם.\nנרשמים כאן:';
+function shareApp() {
+  const url = shareUrl();
+  const ta = h('textarea', { class: 'share-text', rows: 4, dir: 'rtl' });
+  ta.value = defaultShareText();
+  const text = () => ta.value.trim();
+  const full = () => `${text()}\n${url}`;
+  const open = u => window.open(u, '_blank', 'noopener');
+  const close = () => ov.remove();
+  const btn = (cls, emo, label, fn) => h('button', { type: 'button', class: `share-btn ${cls}`, onclick: fn }, h('span', {}, emo), label);
+  const ov = h('div', { class: 'overlay', onclick: e => { if (e.target === ov) close(); } },
+    h('div', { class: 'pop stack', style: 'text-align:right;max-width:440px' },
+      h('h2', {}, '📤 שיתוף "קוראים בכיף"'),
+      h('p', { class: 'muted', style: 'margin:0' }, 'ההודעה שתישלח (אפשר לערוך):'),
+      ta,
+      h('div', { class: 'share-link', dir: 'ltr' }, url),
+      h('div', { class: 'share-grid' },
+        navigator.share ? btn('native', '📲', 'כל אפשרויות השיתוף', async () => { try { await navigator.share({ title: 'קוראים בכיף', text: text(), url }); } catch { } }) : null,
+        btn('wa', '💬', 'WhatsApp', () => open(`https://wa.me/?text=${encodeURIComponent(full())}`)),
+        btn('tg', '✈️', 'Telegram', () => open(`https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text())}`)),
+        btn('mail', '✉️', 'אימייל', () => { location.href = `mailto:?subject=${encodeURIComponent('בואו לקרוא ב"קוראים בכיף" 🦉')}&body=${encodeURIComponent(full())}`; }),
+        btn('copy', '📋', 'העתקת קישור', async () => {
+          try { await navigator.clipboard.writeText(full()); toast('הקישור וההודעה הועתקו ✅'); } catch { toast('לא הצלחנו להעתיק – סמנו והעתיקו ידנית'); }
+        })),
+      siteConfig.registration ? null : h('div', { class: 'tip' }, '⚠️ ההרשמה סגורה כרגע – מי שיקבל את הקישור לא יוכל להירשם. אפשר לפתוח אותה בדף הניהול.'),
+      siteConfig.approval ? h('p', { class: 'muted', style: 'margin:0' }, 'שימו לב: אישור מנהל פעיל – תצטרכו לאשר כל מי שנרשם.') : null,
+      h('button', { class: 'btn-ghost btn-full', onclick: close }, 'סגירה')));
+  document.body.append(ov);
+}
+
 /* ================= admin ================= */
 const fmtDate = t => t ? new Date(t).toLocaleDateString('he-IL') : '—';
 routes.admin = (sub, id) => {
@@ -1553,8 +1587,12 @@ async function adminList(body) {
   const nUser = h('input', { type: 'text', placeholder: 'שם משתמש (באנגלית)', dir: 'ltr', style: 'text-align:right', autocapitalize: 'none' });
   const nPw = h('input', { type: 'text', placeholder: 'סיסמה (לפחות 6 תווים)', dir: 'ltr', style: 'text-align:right' });
   const err = errBox();
+  siteConfig = { ...siteConfig, ...settings };
 
-  body.replaceChildren(
+  body.replaceChildren(h('div', { class: 'stack' },
+    h('div', { class: 'row' },
+      h('button', { class: 'btn-big grow share-main', onclick: shareApp }, '📤 שיתוף האפליקציה'),
+      h('button', { class: 'btn-big btn-ghost grow', onclick: () => document.getElementById('add-user')?.scrollIntoView({ behavior: 'smooth' }) }, '➕ משתמש חדש')),
     h('div', { class: 'stats' },
       h('div', { class: 'stat' }, h('b', {}, users.length), 'משתמשים'),
       h('div', { class: 'stat' }, h('b', {}, users.filter(u => u.last_day === todayKey()).length), 'תרגלו היום'),
@@ -1585,7 +1623,7 @@ async function adminList(body) {
           h('button', { class: 'btn-small btn-ghost', style: 'color:var(--orange)', onclick: () => {
             if (confirm(`למחוק את ${u.display_name} (${u.username}) וכל ההתקדמות שלו/ה? אי אפשר לבטל.`)) act(() => API.call(`/admin/users/${u.id}`, { method: 'DELETE' }), 'נמחק');
           } }, '🗑 מחיקה'))))),
-    h('div', { class: 'card stack' }, h('h3', {}, '➕ הוספת משתמש'),
+    h('div', { class: 'card stack', id: 'add-user' }, h('h3', {}, '➕ הוספת משתמש'),
       nName, nUser, nPw,
       seg([['m', 'בן'], ['f', 'בת']], nu.gender, v => { nu.gender = v; }),
       seg([['student', 'תלמיד/ה'], ['admin', 'מנהל/ת']], nu.role, v => { nu.role = v; }),
@@ -1595,7 +1633,7 @@ async function adminList(body) {
           await API.call('/admin/users', { method: 'POST', body: { display_name: nName.value.trim(), username: nUser.value.trim(), password: nPw.value, gender: nu.gender, role: nu.role } });
           toast('המשתמש נוסף ✓'); render();
         } catch (e) { showErr(err, e.message); }
-      } }, 'הוספה')));
+      } }, 'הוספה'))));
 }
 
 async function adminUser(body, id) {

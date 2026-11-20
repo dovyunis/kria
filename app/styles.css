@@ -369,3 +369,14 @@ label.remember { font-weight: 400; cursor: pointer; }
   .land-bg .fl { font-size: 1.7rem; opacity: .3; }
 }
 @keyframes hpopin { from { transform: scale(.4) translateY(8px); opacity: 0; } }
+
+/* ---------- share / invite ---------- */
+.share-main { background: #25d366 !important; color: #fff !important; }
+.share-text { font-family: var(--ui) !important; font-size: 16px !important; line-height: 1.6 !important; min-height: 110px; }
+.share-link { font-size: 14px; color: var(--muted); word-break: break-all; text-align: left; }
+.share-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.share-btn { flex-direction: column; gap: 2px; padding: 12px 8px; background: var(--card); color: var(--ink); border: 2px solid var(--line); box-shadow: 0 3px 0 var(--line); }
+.share-btn span { font-size: 26px; }
+.share-btn.native { grid-column: 1 / -1; background: var(--primary); border-color: #5143c9; color: #fff; box-shadow: 0 3px 0 #4434b5; }
+.share-btn.wa { background: #25d366; border-color: #1a9e4b; color: #fff; box-shadow: 0 3px 0 #1a9e4b; }
+.share-btn.tg { background: #2aa3df; border-color: #1c7fb0; color: #fff; box-shadow: 0 3px 0 #1c7fb0; }
